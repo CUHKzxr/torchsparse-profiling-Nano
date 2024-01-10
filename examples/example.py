@@ -53,7 +53,7 @@ if __name__ == '__main__':
     np.random.seed(0)
     torch.manual_seed(0)
 
-    dataset = RandomDataset(input_size=10000, voxel_size=0.2)
+    dataset = RandomDataset(input_size=10, voxel_size=0.2)
     dataflow = torch.utils.data.DataLoader(
         dataset,
         batch_size=2,

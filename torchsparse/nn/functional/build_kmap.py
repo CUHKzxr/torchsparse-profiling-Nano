@@ -6,6 +6,7 @@ import torchsparse.backend
 from torchsparse.nn import functional as F
 from torchsparse.nn.utils import get_kernel_offsets
 from torchsparse.utils import make_ntuple
+import time
 
 __all__ = ['build_kernel_map']
 
@@ -15,6 +16,8 @@ def build_kernel_map(_coords: torch.Tensor,
                      stride: Union[int, Tuple[int, ...]] = 2,
                      tensor_stride: Union[int, Tuple[int, ...]] = 1,
                      mode='hashmap') -> torch.Tensor:
+    # torch.cuda.synchronize()
+    pre = time.process_time()
     if mode == 'grid':
         coords = _coords[:, [3, 0, 1, 2]]
         stride = make_ntuple(stride, ndim=3)
@@ -39,6 +42,11 @@ def build_kernel_map(_coords: torch.Tensor,
 
         nbmaps = out[0]
         input_mask, output_mask = out[-2:]
+        
+        # torch.cuda.synchronize()
+        post = time.process_time()
+        torchsparse.backends.test_time[-1][0] = post - pre
+        
         if len(out) == 4:
             return out
         else:
@@ -48,15 +56,29 @@ def build_kernel_map(_coords: torch.Tensor,
                                      stride=tensor_stride,
                                      device=_coords.device)
 
-        references = F.sphash(_coords)
+        if torchsparse.backends.profiling:
+            with torch.profiler.record_function("sphash"):
+                references = F.sphash(_coords)
+        else:
+            references = F.sphash(_coords)
         kernel_size = make_ntuple(kernel_size, ndim=3)
         stride = make_ntuple(stride, ndim=3)
         if any(s > 1 for s in stride):
             coords = F.spdownsample(_coords, stride, kernel_size, tensor_stride)
         else:
             coords = _coords
-        queries = F.sphash(coords, offsets)
-        results = F.sphashquery(queries, references)
+        
+        if torchsparse.backends.profiling:
+            with torch.profiler.record_function("sphash"):
+                queries = F.sphash(coords, offsets)
+        else:
+            queries = F.sphash(coords, offsets)
+        
+        if torchsparse.backends.profiling:
+            with torch.profiler.record_function("sphashquery"):
+                results = F.sphashquery(queries, references)
+        else:
+            results = F.sphashquery(queries, references)
         nbsizes = torch.sum(results != -1, dim=1)
         nbmaps = torch.nonzero(results != -1)
         nbmaps[:, 0] = results.view(-1)[nbmaps[:, 0] * results.size(1)
@@ -66,6 +88,12 @@ def build_kernel_map(_coords: torch.Tensor,
         input_mask, output_mask = torchsparse.backend.build_mask_from_kmap(
             _coords.shape[0], coords.shape[0], nbmaps.int(), nbsizes.int())
 
+        # torch.cuda.synchronize()
+        post = time.process_time()
+        # print(input_mask)
+        # print(output_mask)
+        torchsparse.backends.test_time[-1][0] = post - pre
+        
         if any(s > 1 for s in stride):
             return nbmaps, nbsizes, coords, input_mask, output_mask
         else:

@@ -46,7 +46,8 @@ class Conv3d(nn.Module):
         self.config = config
 
         self.kernel_volume = int(np.prod(self.kernel_size))
-        if self.kernel_volume > 1:
+        # if self.kernel_volume > 1:
+        if True:
             self.kernel = nn.Parameter(
                 torch.zeros(self.kernel_volume, in_channels, out_channels))
         else:

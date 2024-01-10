@@ -1,3 +1,5 @@
+import csv
+import time
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -53,20 +55,37 @@ class ConvolutionFunction(Function):
                                      device=input.device)
 
         if input.device.type == 'cuda':
-            output = torchsparse.backend.convolution_forward_cuda(
-                input,
-                weight,
-                nbmaps,
-                nbsizes.cpu(),
-                input_mask,
-                output_mask,
-                sizes[1] if not transposed else sizes[0],
-                epsilon,
-                int(mm_thresh),
-                conv_mode,
-                transposed,
-                buffer,
-            )
+            if torchsparse.backends.profiling:
+                with torch.profiler.record_function("convolution_backend"):
+                    output = torchsparse.backend.convolution_forward_cuda(
+                        input,
+                        weight,
+                        nbmaps,
+                        nbsizes.cpu(),
+                        input_mask,
+                        output_mask,
+                        sizes[1] if not transposed else sizes[0],
+                        epsilon,
+                        int(mm_thresh),
+                        conv_mode,
+                        transposed,
+                        buffer,
+                    )
+            else:
+                output = torchsparse.backend.convolution_forward_cuda(
+                    input,
+                    weight,
+                    nbmaps,
+                    nbsizes.cpu(),
+                    input_mask,
+                    output_mask,
+                    sizes[1] if not transposed else sizes[0],
+                    epsilon,
+                    int(mm_thresh),
+                    conv_mode,
+                    transposed,
+                    buffer,
+                )      
         elif input.device.type == 'cpu':
             torchsparse.backend.convolution_forward_cpu(input, output, weight,
                                                         nbmaps, nbsizes.cpu(),
@@ -149,6 +168,10 @@ def conv3d(
     mm_thresh: int = 0,
     kmap_mode: str = 'hashmap',
 ) -> SparseTensor:
+    
+    # torch.cuda.synchronize()
+    pre = time.process_time()
+    
     feats, coords = input.feats, input.coords
 
     kernel_size = make_ntuple(kernel_size, ndim=3)
@@ -165,17 +188,26 @@ def conv3d(
                                  device=input.F.device,
                                  requires_grad=False)
 
-    if kernel_size == (1, 1, 1) and stride == (1, 1, 1) and dilation == (1, 1,
-                                                                         1):
-        feats = feats.matmul(weight)
+    if kernel_size == (1, 1, 1) and stride == (1, 1, 1) \
+        and dilation == (1, 1, 1) and weight.shape[0]==1:
+        # pre_matmul = time.process_time()
+        feats = feats.matmul(weight[0])
+        # post_matmul = time.process_time()
         if bias is not None:
             feats += bias
         output = SparseTensor(coords=coords, feats=feats, stride=input.stride)
+
     elif not transposed:
+        torchsparse.backends.test_time.append([0, 0])
         kmap = input.kmaps.get((input.stride, kernel_size, stride, dilation))
         if kmap is None:
             if any(s > 1 for s in stride):
-                kmap_out = F.build_kernel_map(coords, kernel_size, stride,
+                if torchsparse.backends.profiling:
+                    with torch.profiler.record_function("mapping"):
+                        kmap_out = F.build_kernel_map(coords, kernel_size, stride,
+                                              input.stride, kmap_mode)
+                else:
+                    kmap_out = F.build_kernel_map(coords, kernel_size, stride,
                                               input.stride, kmap_mode)
                 if len(kmap_out) == 3:
                     nbmaps, nbsizes, coords = kmap_out
@@ -186,7 +218,12 @@ def conv3d(
                     raise NotImplementedError
             else:
 
-                kmap_out = F.build_kernel_map(coords, kernel_size, stride,
+                if torchsparse.backends.profiling:
+                    with torch.profiler.record_function("mapping"):
+                        kmap_out = F.build_kernel_map(coords, kernel_size, stride,
+                                              input.stride, kmap_mode)
+                else:
+                    kmap_out = F.build_kernel_map(coords, kernel_size, stride,
                                               input.stride, kmap_mode)
                 if len(kmap_out) == 2:
                     nbmaps, nbsizes = kmap_out
@@ -229,6 +266,7 @@ def conv3d(
             stride=tuple(input.stride[k] * stride[k] for k in range(3)),
         )
     else:
+        torchsparse.backends.test_time.append([0, 0])
         tensor_stride = tuple(input.stride[k] // stride[k] for k in range(3))
         kmap = input.kmaps[(tensor_stride, kernel_size, stride, dilation)]
         feats = ConvolutionFunction.apply(
@@ -256,4 +294,16 @@ def conv3d(
     output.cmaps = input.cmaps
     output.cmaps.setdefault(output.stride, output.coords)
     output.kmaps = input.kmaps
+    
+    # torch.cuda.synchronize()
+    post = time.process_time()
+    if kernel_size == (1, 1, 1) and stride == (1, 1, 1) \
+        and dilation == (1, 1, 1) and weight.shape[0]==1:
+        # torchsparse.backends.test_time[-1][2] = post_matmul - pre_matmul
+        # torchsparse.backends.test_time[-1][4] = post - pre
+        
+        pass
+    else:
+        torchsparse.backends.test_time[-1][1] = post - pre
+    
     return output

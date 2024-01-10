@@ -276,19 +276,28 @@ __global__ void scatter_all_kernel_pad_sep_with_mask_float(
 //                         fused gather-scatter and matmul grouping. Kernel
 //                         reordering should be done in piror steps for
 //                         grouping to function properly
+std::chrono::duration<long long, std::nano> duration_gather;
+std::chrono::duration<long long, std::nano> duration_matmul;
+std::chrono::duration<long long, std::nano> duration_scatter;
+
 at::Tensor convolution_forward_cuda(
     at::Tensor in_feat, at::Tensor kernel, at::Tensor neighbor_map,
     at::Tensor neighbor_offset, at::Tensor input_mask, at::Tensor output_mask,
     const int output_size, const float epsilon, const int mm_thresh,
     const int conv_mode, const bool transpose, at::Tensor global_buffer) {
+  duration_gather = std::chrono::nanoseconds(0);
+  duration_matmul = std::chrono::nanoseconds(0);
+  duration_scatter = std::chrono::nanoseconds(0);
+  at::Tensor output;
   int buffer_size = (int)torch::sum(neighbor_offset).item<int>();
+
   // be careful about the fallback setting
 
   // [!!!] NOTE: be careful, current buffer_size calculation is wrong, it does
   // not take into consideration padding!
   // if(1){
   if (conv_mode == 0) {
-    return convolution_forward_cuda_fallback(in_feat, kernel, neighbor_map,
+    output = convolution_forward_cuda_fallback(in_feat, kernel, neighbor_map,
                                              output_size, conv_mode,
                                              neighbor_offset, transpose);
   } else if (buffer_size * (in_feat.size(1) + kernel.size(-1)) >
@@ -297,17 +306,26 @@ at::Tensor convolution_forward_cuda(
     // std::cout << "fallback: " << buffer_size * (in_feat.size(1) +
     // out_feat.size(1)) << " " << global_buffer.size(0) << std::endl;
     //  global buffer not large enough, fall back
-    return convolution_forward_cuda_fallback(in_feat, kernel, neighbor_map,
+    output = convolution_forward_cuda_fallback(in_feat, kernel, neighbor_map,
                                              output_size, conv_mode,
                                              neighbor_offset, transpose);
   } else {
     // std::cout << "not fallback: " << buffer_size * (in_feat.size(1) +
     // out_feat.size(1)) << " " << global_buffer.size(0) << std::endl;
     //  global buffer large enough, do all gather / all scatter
-    return convolution_forward_cuda_latest(
+    output = convolution_forward_cuda_latest(
         in_feat, kernel, neighbor_map, neighbor_offset, input_mask, output_mask,
         output_size, epsilon, mm_thresh, conv_mode, transpose, global_buffer);
   }
+  // std::ofstream file("/home/nano/torchsparse/data/backend_time.csv", std::ios::app | std::ios::out);
+  // if (file.is_open()) {
+  //   file << duration_gather.count() << "," << duration_matmul.count() << "," << duration_scatter.count() << "\n";
+  //   file.close();
+  // } else {
+  //     std::cout << "无法打开文件。" << std::endl;
+  // }
+  return output;
+
 }
 
 void group_strategy_generation(
@@ -546,6 +564,7 @@ at::Tensor convolution_forward_cuda_latest(
   }
 
   // all gather
+  auto start = std::chrono::steady_clock::now();
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       in_feat.type(), "convolution_forward_cuda", ([&] {
         gather_all_kernel_pad_sep_with_mask<scalar_t>
@@ -561,7 +580,10 @@ at::Tensor convolution_forward_cuda_latest(
                       input_mask.data_ptr<int>(), output_mask.data_ptr<int>(),
                       transpose, precompute_mid);
       }));
-
+  auto end = std::chrono::steady_clock::now();
+  duration_gather += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+  start = end;
+  
   at::Tensor in_buffer_activated, out_buffer_activated, kernel_buffer;
   int buffer_st;
   int cur_buffer_size;
@@ -646,6 +668,9 @@ at::Tensor convolution_forward_cuda_latest(
     }
   }
 
+  end = std::chrono::steady_clock::now();
+  duration_matmul += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+  start = end;
   if (is_half) {
     // new version
     scatter_all_kernel_pad_sep_with_mask_half<<<
@@ -668,6 +693,8 @@ at::Tensor convolution_forward_cuda_latest(
         cum_buffer_sizes_gpu.data_ptr<int>(), input_mask.data_ptr<int>(),
         output_mask.data_ptr<int>(), transpose, precompute_mid);
   }
+  end = std::chrono::steady_clock::now();
+  duration_scatter += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
 
   if (precompute_mid)
     at::addmm_out(out_feat, out_feat, in_feat, kernel[mid_kernel]);
@@ -743,6 +770,9 @@ at::Tensor convolution_forward_cuda_fallback(
   auto in_buffer = torch::zeros({in_buffer_size, n_in_channels}, options);
   auto out_buffer = torch::zeros({in_buffer_size, n_out_channels}, options);
   int cur_offset = 0;
+
+  auto start = std::chrono::steady_clock::now();
+  auto end = start;
   // gather/gemm/scatter on each weight
   for (int i = 0; i < kernel_volume; i++) {
     int n_active_feats = neighbor_offset.data_ptr<int>()[i];
@@ -778,6 +808,7 @@ at::Tensor convolution_forward_cuda_fallback(
     }
     // gather n_active_feats dense features from N sparse input features with c
     // feature dimensions
+    start = std::chrono::steady_clock::now();
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
         in_feat.type(), "convolution_forward_cuda", ([&] {
           gather_kernel<scalar_t>
@@ -787,12 +818,19 @@ at::Tensor convolution_forward_cuda_fallback(
                   in_buffer_activated.data_ptr<scalar_t>(),
                   neighbor_map.data_ptr<int>() + cur_offset, transpose);
         }));
+    end = std::chrono::steady_clock::now();
+    duration_gather += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    start = end;
     // gemm: (i, c) X (c, o) = (i, o)
     int kmap_idx = i;
     if (conv_mode == 2) {
       kmap_idx = i < mid_kernel ? i * 2 : (kernel_volume - i) * 2 - 1;
     }
     torch::mm_out(out_buffer_activated, in_buffer_activated, kernel[kmap_idx]);
+
+    end = std::chrono::steady_clock::now();
+    duration_matmul += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    start = end;
     // scatter n_active_feats dense features into n_out_feats output features of
     // dimension n_out_channels
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
@@ -804,6 +842,8 @@ at::Tensor convolution_forward_cuda_fallback(
                   out_feat.data_ptr<scalar_t>(),
                   neighbor_map.data_ptr<int>() + cur_offset, transpose);
         }));
+    end = std::chrono::steady_clock::now();
+    duration_scatter += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
     cur_offset += 2 * n_active_feats;
   }
 
@@ -812,6 +852,7 @@ at::Tensor convolution_forward_cuda_fallback(
   }
   return out_feat;
 }
+
 void convolution_backward_cuda(at::Tensor in_feat, at::Tensor grad_in_feat,
                                at::Tensor grad_out_feat, at::Tensor kernel,
                                at::Tensor grad_kernel, at::Tensor neighbor_map,
