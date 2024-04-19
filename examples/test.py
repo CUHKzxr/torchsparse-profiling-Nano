@@ -188,21 +188,21 @@ def read_weight_from_onnx(module:torch.nn.Module, f, dict, device):
         else:
             raise RuntimeError('invalid initializer input name:'+name_)
 
-def statis(list , path, model_type, index):
+def statis(list, model_type, epoch):
     if model_type is SparseResUNet42:
         size = 42
     else :
         size = 21
     backend_df = pd.read_csv('/home/nano/torchsparse/data/backend_time.csv',header=None)
     backend = torch.tensor(backend_df.values,dtype=torch.long)
-    cur_list = list[-size:]
-    cur_list = torch.tensor(cur_list)
+    # cur_list = list[-size:]
+    # cur_list = torch.tensor(cur_list)
     cur_backend = backend[-size:]
     raito = float(1e-9)
-    sum_list = torch.sum(cur_list,0)
+    # sum_list = torch.sum(cur_list,0)
     sum_backend = torch.sum(cur_backend,0)
-    return sum_list[0].item(), sum_backend[0].item() * raito, sum_backend[1].item() * raito, \
-                sum_backend[2].item() * raito, sum_list[1].item()
+    return sum_backend[0].item() * raito/epoch, sum_backend[1].item() * raito/epoch, \
+                sum_backend[2].item() * raito/epoch, sum_backend[3].item() * raito/epoch
 
 def statis_(list , path, model_type, index):
     if model_type is SparseResUNet42:
@@ -215,110 +215,150 @@ def statis_(list , path, model_type, index):
     sum_list = torch.sum(cur_list,0)
     return sum_list[0].item(), -1, -1, -1, sum_list[1].item()
 
+# path_list = ['/home/nano/torchsparse/data/unet/0.5k_2/coords.csv', 
+#              '/home/nano/torchsparse/data/unet/0.5k_2/feats.csv', 
+#              '/home/nano/torchsparse/data/unet/0.5k_4/unet_v2_0.5k_4_fused.onnx', 
+#              '/home/nano/torchsparse/data/unet_result/0.5k_2', ]
+
+# path_list = ['/home/nano/torchsparse/data/unet/0.5k_4/coords.csv', 
+#              '/home/nano/torchsparse/data/unet/0.5k_4/feats.csv', 
+#              '/home/nano/torchsparse/data/unet/0.5k_4/unet_v2_0.5k_4_fused.onnx', 
+#              '/home/nano/torchsparse/data/unet_result/0.5k_4', ]
+
+path_list = ['/home/nano/torchsparse/data/unet/0.5k_8/coords.csv', 
+             '/home/nano/torchsparse/data/unet/0.5k_8/feats.csv', 
+             '/home/nano/torchsparse/data/unet/0.5k_8/unet_v2_0.5k_8_fused.onnx', 
+             '/home/nano/torchsparse/data/unet_result/0.5k_8', ]
+
+# path_list = ['/home/nano/torchsparse/data/unet/0.5k_16/coords.csv', 
+#              '/home/nano/torchsparse/data/unet/0.5k_16/feats.csv', 
+#              '/home/nano/torchsparse/data/unet/0.5k_16/unet_v2_0.5k_16_fused.onnx', 
+#              '/home/nano/torchsparse/data/unet_result/0.5k_16', ]
+
+# path_list = ['/home/nano/torchsparse/data/unet/1k/coords.csv', 
+#              '/home/nano/torchsparse/data/unet/1k/feats.csv', 
+#              '/home/nano/torchsparse/data/unet/1k/unet_v2_opt_fused_1k.onnx', 
+#              '/home/nano/torchsparse/data/unet_result/1k', ]
+
+# path_list = ['/home/nano/torchsparse/data/unet/1k_2/coords.csv', 
+#              '/home/nano/torchsparse/data/unet/1k_2/feats.csv', 
+#              '/home/nano/torchsparse/data/unet/1k_2/unet_v2_opt_fused_1k_2.onnx', 
+#              '/home/nano/torchsparse/data/unet_result/1k', ]
+
+
+
+
 
 @torch.no_grad()
 def main():
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    file_path = './data/backend_time.csv'
-    if os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-            print(f"文件 {file_path} 已成功删除")
-        except PermissionError:
-            print(f"无权限删除文件 {file_path}")
-        except Exception as e:
-            print(f"删除文件 {file_path} 发生错误：{str(e)}")
-    coords_df = pd.read_csv('/home/nano/torchsparse/data/coords.csv',header=None)
+    
+    coords_df = pd.read_csv(path_list[0],header=None)
     coords = torch.tensor(coords_df.values,dtype=torch.int).to(device)
-    feats_df = pd.read_csv('/home/nano/torchsparse/data/feats.csv', header=None)
+    feats_df = pd.read_csv(path_list[1], header=None)
     feats = torch.tensor(feats_df.values, dtype=torch.float32)
     input = SparseTensor(coords=coords, feats=feats).to(device)
     
-    for backbone in [SparseResNet21D]:
+    for backbone in [SparseResUNet42]:
         print(f'{backbone.__name__}:')
-        model: nn.Module = backbone(in_channels=4, width_multiplier=1.0)
-        if(backbone is SparseResUNet42):
-            read_weight_from_onnx(model, "/home/nano/torchsparse/data/unet_v2.onnx", unet_dict(), device)
-        else:
-            read_weight_from_onnx(model, "/home/nano/torchsparse/data/resnet_v2.onnx",resnet_dict_(), device)
-        model = model.to(device).eval()
-        
-        # warm up
-        for i in range(10):
-            input.cmaps = {}
-            input.kmaps = {}
-            outputs = model(input)
-            torch.cuda.synchronize(device)
-        torch.cuda.synchronize(device)
-        
-        epoch = 10
-        
-        results = np.zeros([epoch,2])
-        starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        for i in range(epoch):
-            input.cmaps = {}
-            input.kmaps = {}
-            torch.cuda.synchronize(device)
-            pre = time.perf_counter()
-            starter.record()
-            outputs = model(input)
-            torch.cuda.synchronize(device)
-            post = time.perf_counter()
-            ender.record()
-            inf_t = post-pre
-            _time = starter.elapsed_time(ender) / 1000
-            results[i] = [inf_t,_time]
-            print("===============================================")
-            print("total:", inf_t, ",", _time)
+        file_path = './data/backend_time.csv'
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                print(f"文件 {file_path} 已成功删除")
+            except PermissionError:
+                print(f"无权限删除文件 {file_path}")
+            except Exception as e:
+                print(f"删除文件 {file_path} 发生错误：{str(e)}")
             
-        print("============================================")
-        print("average:")
-        print(np.mean(results,axis=0))
-        torch.cuda.synchronize(device)
-        results = np.zeros([epoch,2])
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True,) as prof:
-            torchsparse.backends.profiling=True
-            for i in range(1):
+        model: nn.Module = backbone(in_channels=4, width_multiplier=1.0)
+        # if(backbone is SparseResUNet42):
+        #     read_weight_from_onnx(model, path_list[2], unet_dict(), device)
+        # else:
+        #     read_weight_from_onnx(model, path_list[2],resnet_dict_(), device)
+        
+        with open(path_list[3]+f'/{backbone.__name__}.txt', 'a') as file:    
+            file.write("=============================================================================================================" + '\n')
+            file.write("start\n")
+            model = model.to(device).eval()
+            
+            # warm up
+            for i in range(5):
+                input.cmaps = {}
+                input.kmaps = {}
+                outputs = model(input)
+                torch.cuda.synchronize(device)
+            torch.cuda.synchronize(device)
+            
+            epoch = 10
+            
+            torchsparse.backends.profiling=False
+            results = np.zeros([epoch,2])
+            # starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            for i in range(epoch):
+                input = SparseTensor(coords=coords, feats=feats).to(device)
                 input.cmaps = {}
                 input.kmaps = {}
                 torch.cuda.synchronize(device)
                 pre = time.perf_counter()
-                starter.record()
+                # starter.record()
                 outputs = model(input)
                 torch.cuda.synchronize(device)
                 post = time.perf_counter()
-                ender.record()
-                # mapping, gather, matmul, scatter, conv = statis_(torchsparse.backends.test_time, './data/backend_time.csv', backbone, 0) 
-                # mapping, gather, matmul, scatter, conv = -1, -1, -1, -1, -1,
+                # ender.record()
                 inf_t = post-pre
-                _time = starter.elapsed_time(ender) / 1000
-                # results[i] = [inf_t,mapping, gather, matmul, scatter, conv, inf_t-conv]
-                print("===============================================")
-                print("total:", inf_t, _time)
-                # print("mapping:", mapping, ", ", mapping/inf_t*100, "%")
-                # print("gather:", gather, ", ", gather/inf_t*100, "%")
-                # print("matmul:", matmul, ", ", matmul/inf_t*100, "%")
-                # print("scatter:", scatter, ", ", scatter/inf_t*100, "%")
-                # print("conv:", conv, ", ", conv/inf_t*100, "%")
-                # print("other:", inf_t-conv, ", ", (inf_t-conv)/inf_t*100, "%")
+                # _time = starter.elapsed_time(ender) / 1000
+                results[i] = [inf_t,-1]
+                print('===============================================')
+                print('total:', inf_t, ',', -1)
+                print('total:', inf_t, ',', -1, file=file)
+                # file.write('total:' + str(inf_t) + ',' + '\n')
+                
+            print('============================================')
+            print('average:')
+            print(np.mean(results,axis=0))
+            print('average:', np.mean(results,axis=0), file=file)
+            file.write("next profiling\n")
+            
+            torch.cuda.synchronize(device)
+            results = np.zeros([epoch,1])
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True,) as prof:
+                torchsparse.backends.profiling=True
+                for i in range(epoch):
+                    input.cmaps = {}
+                    input.kmaps = {}
+                    torch.cuda.synchronize(device)
+                    pre = time.perf_counter()
+                    # starter.record()
+                    outputs = model(input)
+                    torch.cuda.synchronize(device)
+                    post = time.perf_counter()
+                    # ender.record()
+                    # mapping, gather, matmul, scatter, conv = statis_(torchsparse.backends.test_time, './data/backend_time.csv', backbone, 0) 
+                    # mapping, gather, matmul, scatter, conv = -1, -1, -1, -1, -1,
+                    inf_t = post-pre
+                    # _time = starter.elapsed_time(ender) / 1000
+                    results[i] = [inf_t,]
+                    print('===============================================')
+                    print('total:', inf_t, -1)
+                    # print('mapping:', mapping, ', ', mapping/inf_t*100, '%')
+                    # print('gather:', gather, ', ', gather/inf_t*100, '%')
+                    # print('matmul:', matmul, ', ', matmul/inf_t*100, '%')
+                    # print('scatter:', scatter, ', ', scatter/inf_t*100, '%')
+                    # print('conv:", conv, ", ", conv/inf_t*100, "%")
+                    # print("other:", inf_t-conv, ", ", (inf_t-conv)/inf_t*100, "%")
             print("============================================")
             print("average:")
             print(np.mean(results,axis=0))
-        print(prof.key_averages(group_by_stack_n=5).table(sort_by='self_cpu_time_total', row_limit=5))
-        prof.export_chrome_trace("./data/trace.json")
-            # print(inf_t)
-            # print(mapping)
-            # print(mapping/inf_t*100, "%")
-            # print(gather)
-            # print(gather/inf_t*100, "%")
-            # print(matmul)
-            # print(matmul/inf_t*100, "%")
-            # print(scatter)
-            # print(scatter/inf_t*100, "%")
-            # print(conv)
-            # print(conv/inf_t*100, "%")
-            # print(inf_t-conv)
-            # print((inf_t-conv)/inf_t*100, "%")
+            print('average:', np.mean(results,axis=0), file=file)
+            print(statis([], backbone, epoch))
+            file.write("average (gather, matmal, scatter, conv_backend total)\n")
+            print(statis([], backbone, epoch), file=file)
+            
+            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
+            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100), file=file)
+            file.close()
+            prof.export_chrome_trace(path_list[3]+f'/{backbone.__name__}_trace.json')
 
 if __name__ == '__main__':
     main()
@@ -327,5 +367,5 @@ if __name__ == '__main__':
     # pre = time.process_time()
     # inf = main()
     # post = time.process_time()
-    # print("total time:", post-pre)
+    # print('total time:', post-pre)
     # print(inf/(post-pre))

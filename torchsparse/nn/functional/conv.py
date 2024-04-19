@@ -57,7 +57,7 @@ class ConvolutionFunction(Function):
         if input.device.type == 'cuda':
             if torchsparse.backends.profiling:
                 with torch.profiler.record_function("convolution_backend"):
-                    output = torchsparse.backend.convolution_forward_cuda(
+                    output = torchsparse.backend.convolution_forward_cuda_profiling(
                         input,
                         weight,
                         nbmaps,

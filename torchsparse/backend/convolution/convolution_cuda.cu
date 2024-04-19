@@ -276,21 +276,15 @@ __global__ void scatter_all_kernel_pad_sep_with_mask_float(
 //                         fused gather-scatter and matmul grouping. Kernel
 //                         reordering should be done in piror steps for
 //                         grouping to function properly
-std::chrono::duration<long long, std::nano> duration_gather;
-std::chrono::duration<long long, std::nano> duration_matmul;
-std::chrono::duration<long long, std::nano> duration_scatter;
 
 at::Tensor convolution_forward_cuda(
     at::Tensor in_feat, at::Tensor kernel, at::Tensor neighbor_map,
     at::Tensor neighbor_offset, at::Tensor input_mask, at::Tensor output_mask,
     const int output_size, const float epsilon, const int mm_thresh,
     const int conv_mode, const bool transpose, at::Tensor global_buffer) {
-  duration_gather = std::chrono::nanoseconds(0);
-  duration_matmul = std::chrono::nanoseconds(0);
-  duration_scatter = std::chrono::nanoseconds(0);
-  at::Tensor output;
-  int buffer_size = (int)torch::sum(neighbor_offset).item<int>();
 
+  int buffer_size = (int)torch::sum(neighbor_offset).item<int>();
+  at::Tensor output;
   // be careful about the fallback setting
 
   // [!!!] NOTE: be careful, current buffer_size calculation is wrong, it does
@@ -317,13 +311,7 @@ at::Tensor convolution_forward_cuda(
         in_feat, kernel, neighbor_map, neighbor_offset, input_mask, output_mask,
         output_size, epsilon, mm_thresh, conv_mode, transpose, global_buffer);
   }
-  // std::ofstream file("/home/nano/torchsparse/data/backend_time.csv", std::ios::app | std::ios::out);
-  // if (file.is_open()) {
-  //   file << duration_gather.count() << "," << duration_matmul.count() << "," << duration_scatter.count() << "\n";
-  //   file.close();
-  // } else {
-  //     std::cout << "无法打开文件。" << std::endl;
-  // }
+  
   return output;
 
 }
@@ -564,7 +552,6 @@ at::Tensor convolution_forward_cuda_latest(
   }
 
   // all gather
-  auto start = std::chrono::steady_clock::now();
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       in_feat.type(), "convolution_forward_cuda", ([&] {
         gather_all_kernel_pad_sep_with_mask<scalar_t>
@@ -580,9 +567,6 @@ at::Tensor convolution_forward_cuda_latest(
                       input_mask.data_ptr<int>(), output_mask.data_ptr<int>(),
                       transpose, precompute_mid);
       }));
-  auto end = std::chrono::steady_clock::now();
-  duration_gather += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-  start = end;
   
   at::Tensor in_buffer_activated, out_buffer_activated, kernel_buffer;
   int buffer_st;
@@ -668,9 +652,6 @@ at::Tensor convolution_forward_cuda_latest(
     }
   }
 
-  end = std::chrono::steady_clock::now();
-  duration_matmul += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-  start = end;
   if (is_half) {
     // new version
     scatter_all_kernel_pad_sep_with_mask_half<<<
@@ -693,8 +674,6 @@ at::Tensor convolution_forward_cuda_latest(
         cum_buffer_sizes_gpu.data_ptr<int>(), input_mask.data_ptr<int>(),
         output_mask.data_ptr<int>(), transpose, precompute_mid);
   }
-  end = std::chrono::steady_clock::now();
-  duration_scatter += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
 
   if (precompute_mid)
     at::addmm_out(out_feat, out_feat, in_feat, kernel[mid_kernel]);
@@ -771,8 +750,6 @@ at::Tensor convolution_forward_cuda_fallback(
   auto out_buffer = torch::zeros({in_buffer_size, n_out_channels}, options);
   int cur_offset = 0;
 
-  auto start = std::chrono::steady_clock::now();
-  auto end = start;
   // gather/gemm/scatter on each weight
   for (int i = 0; i < kernel_volume; i++) {
     int n_active_feats = neighbor_offset.data_ptr<int>()[i];
@@ -808,7 +785,6 @@ at::Tensor convolution_forward_cuda_fallback(
     }
     // gather n_active_feats dense features from N sparse input features with c
     // feature dimensions
-    start = std::chrono::steady_clock::now();
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
         in_feat.type(), "convolution_forward_cuda", ([&] {
           gather_kernel<scalar_t>
@@ -818,9 +794,7 @@ at::Tensor convolution_forward_cuda_fallback(
                   in_buffer_activated.data_ptr<scalar_t>(),
                   neighbor_map.data_ptr<int>() + cur_offset, transpose);
         }));
-    end = std::chrono::steady_clock::now();
-    duration_gather += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-    start = end;
+    
     // gemm: (i, c) X (c, o) = (i, o)
     int kmap_idx = i;
     if (conv_mode == 2) {
@@ -828,9 +802,6 @@ at::Tensor convolution_forward_cuda_fallback(
     }
     torch::mm_out(out_buffer_activated, in_buffer_activated, kernel[kmap_idx]);
 
-    end = std::chrono::steady_clock::now();
-    duration_matmul += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-    start = end;
     // scatter n_active_feats dense features into n_out_feats output features of
     // dimension n_out_channels
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
@@ -842,8 +813,7 @@ at::Tensor convolution_forward_cuda_fallback(
                   out_feat.data_ptr<scalar_t>(),
                   neighbor_map.data_ptr<int>() + cur_offset, transpose);
         }));
-    end = std::chrono::steady_clock::now();
-    duration_scatter += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    
     cur_offset += 2 * n_active_feats;
   }
 
@@ -953,4 +923,500 @@ void convolution_backward_cuda(at::Tensor in_feat, at::Tensor grad_in_feat,
         }));
     cur_offset += 2 * n_active_feats;
   }
+}
+
+
+std::chrono::duration<long long, std::nano> duration_gather;
+std::chrono::duration<long long, std::nano> duration_matmul;
+std::chrono::duration<long long, std::nano> duration_scatter;
+std::chrono::duration<long long, std::nano> duration_total;
+
+at::Tensor convolution_forward_cuda_profiling(
+    at::Tensor in_feat, at::Tensor kernel, at::Tensor neighbor_map,
+    at::Tensor neighbor_offset, at::Tensor input_mask, at::Tensor output_mask,
+    const int output_size, const float epsilon, const int mm_thresh,
+    const int conv_mode, const bool transpose, at::Tensor global_buffer) {
+  duration_gather = std::chrono::nanoseconds(0);
+  duration_matmul = std::chrono::nanoseconds(0);
+  duration_scatter = std::chrono::nanoseconds(0);
+  duration_total = std::chrono::nanoseconds(0);
+
+  cudaDeviceSynchronize();
+  auto start = std::chrono::steady_clock::now();
+
+  at::Tensor output;
+  int buffer_size = (int)torch::sum(neighbor_offset).item<int>();
+
+  // be careful about the fallback setting
+
+  // [!!!] NOTE: be careful, current buffer_size calculation is wrong, it does
+  // not take into consideration padding!
+  // if(1){
+  if (conv_mode == 0) {
+    output = convolution_forward_cuda_fallback_profiling(in_feat, kernel, neighbor_map,
+                                             output_size, conv_mode,
+                                             neighbor_offset, transpose);
+  } else if (buffer_size * (in_feat.size(1) + kernel.size(-1)) >
+                 global_buffer.size(0) &&
+             !in_feat.requires_grad()) {
+    // std::cout << "fallback: " << buffer_size * (in_feat.size(1) +
+    // out_feat.size(1)) << " " << global_buffer.size(0) << std::endl;
+    //  global buffer not large enough, fall back
+    output = convolution_forward_cuda_fallback_profiling(in_feat, kernel, neighbor_map,
+                                             output_size, conv_mode,
+                                             neighbor_offset, transpose);
+  } else {
+    // std::cout << "not fallback: " << buffer_size * (in_feat.size(1) +
+    // out_feat.size(1)) << " " << global_buffer.size(0) << std::endl;
+    //  global buffer large enough, do all gather / all scatter
+    output = convolution_forward_cuda_latest_profiling(
+        in_feat, kernel, neighbor_map, neighbor_offset, input_mask, output_mask,
+        output_size, epsilon, mm_thresh, conv_mode, transpose, global_buffer);
+  }
+  cudaDeviceSynchronize();
+  auto end = std::chrono::steady_clock::now();
+  duration_total = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+  std::ofstream file("/home/nano/torchsparse/data/backend_time.csv", std::ios::app | std::ios::out);
+  if (file.is_open()) {
+    file << duration_gather.count() << "," << duration_matmul.count() << "," << duration_scatter.count() << "," << duration_total.count() << "\n";
+    file.close();
+  } else {
+      std::cout << "无法打开文件。" << std::endl;
+  }
+  return output;
+
+}
+
+at::Tensor convolution_forward_cuda_latest_profiling(
+    at::Tensor in_feat, at::Tensor _kernel, at::Tensor neighbor_map,
+    at::Tensor neighbor_offset, at::Tensor input_mask, at::Tensor output_mask,
+    const int output_size, const float epsilon, const int mm_thresh,
+    const int conv_mode, const bool transpose, at::Tensor global_buffer) {
+  if (in_feat.size(1) != _kernel.size(1)) {
+    throw std::invalid_argument("Input feature size and kernel size mismatch");
+  }
+
+  at::Tensor neighbor_offset_gpu = neighbor_offset.to(in_feat.device());
+  at::Tensor neighbor_offset_cum_gpu =
+      torch::cumsum(neighbor_offset_gpu, 0).to(at::ScalarType::Int);
+  at::Tensor neighbor_offset_cum =
+      neighbor_offset_cum_gpu.to(neighbor_offset.device());
+  at::Tensor cum_buffer_sizes = torch::zeros_like(neighbor_offset);
+
+  auto options =
+      torch::TensorOptions().dtype(in_feat.dtype()).device(in_feat.device());
+  bool is_half = in_feat.scalar_type() == at::ScalarType::Half;
+  at::Tensor out_feat = torch::zeros({output_size, _kernel.size(-1)}, options);
+
+  // pad num channels to an even number
+  at::Tensor kernel = _kernel.clone();
+
+  int n_in_channels_original = in_feat.size(1);
+  int n_out_channels_original = out_feat.size(1);
+
+  if (is_half) {
+    if (in_feat.size(1) % 8 != 0) {
+      in_feat = torch::cat(
+          {in_feat,
+           torch::zeros({in_feat.size(0), 8 - (in_feat.size(1) % 8)}, options)},
+          -1);
+      kernel = torch::cat(
+          {kernel, torch::zeros({kernel.size(0), 8 - (kernel.size(1) % 8),
+                                 kernel.size(2)},
+                                options)},
+          1);
+    }
+    if (out_feat.size(1) % 8 != 0) {
+      out_feat = torch::cat(
+          {out_feat,
+           torch::zeros({out_feat.size(0), 8 - (out_feat.size(1) % 8)},
+                        options)},
+          -1);
+      kernel = torch::cat({kernel, torch::zeros({kernel.size(0), kernel.size(1),
+                                                 8 - (kernel.size(2) % 8)},
+                                                options)},
+                          -1);
+    }
+  } else {
+    if (in_feat.size(1) % 4 != 0) {
+      in_feat = torch::cat(
+          {in_feat,
+           torch::zeros({in_feat.size(0), 4 - (in_feat.size(1) % 4)}, options)},
+          -1);
+      kernel = torch::cat(
+          {kernel, torch::zeros({kernel.size(0), 4 - (kernel.size(1) % 4),
+                                 kernel.size(2)},
+                                options)},
+          1);
+    }
+    if (out_feat.size(1) % 4 != 0) {
+      out_feat = torch::cat(
+          {out_feat,
+           torch::zeros({out_feat.size(0), 4 - (out_feat.size(1) % 4)},
+                        options)},
+          -1);
+      kernel = torch::cat({kernel, torch::zeros({kernel.size(0), kernel.size(1),
+                                                 4 - (kernel.size(2) % 4)},
+                                                options)},
+                          -1);
+    }
+  }
+
+  int n_in_feats = in_feat.size(0);
+  int n_in_channels = in_feat.size(1);
+  int n_out_feats = out_feat.size(0);
+  int n_out_channels = out_feat.size(1);
+
+  int kernel_volume = kernel.size(0);
+
+  // memory optimization
+  bool precompute_mid = false;
+  // possibly in the last position
+  int mid_kernel = conv_mode == 2 ? kernel_volume - 1 : kernel_volume / 2;
+  int max_kmap_size = 1;
+  // we can precompute features for w[0,0] which avoids gather/scatter
+  if (kernel_volume % 2 == 1 && n_in_feats == n_out_feats) {
+    precompute_mid = true;
+    max_kmap_size =
+        *std::max_element(neighbor_offset.data_ptr<int>(),
+                          neighbor_offset.data_ptr<int>() + kernel_volume / 2);
+    max_kmap_size =
+        std::max(max_kmap_size,
+                 *std::max_element(
+                     neighbor_offset.data_ptr<int>() + kernel_volume / 2 + 1,
+                     neighbor_offset.data_ptr<int>() + kernel_volume));
+    max_kmap_size = std::max(max_kmap_size, 1);
+  } else {
+    max_kmap_size =
+        *std::max_element(neighbor_offset.data_ptr<int>(),
+                          neighbor_offset.data_ptr<int>() + kernel_volume);
+  }
+
+  std::vector<std::vector<int>> groups;
+  std::vector<int> mm_ops;
+  std::vector<int> group_sizes;
+  at::Tensor pads, cum_pads;
+  int buffer_size;
+  // step0.1: get the groups
+  group_strategy_generation(kernel_volume, epsilon, mm_thresh, conv_mode,
+                            neighbor_offset, precompute_mid, groups, mm_ops,
+                            group_sizes, cum_buffer_sizes, buffer_size);
+  at::Tensor cum_buffer_sizes_gpu =
+      cum_buffer_sizes.to(neighbor_offset_cum_gpu.device());
+
+  // symmetric_mode &= precompute_mid;
+  at::Tensor in_buffer, out_buffer;
+  if (!in_feat.requires_grad()) {
+    if (is_half) {
+      in_buffer = torch::from_blob(global_buffer.data_ptr<at::Half>(),
+                                   {buffer_size, n_in_channels}, options);
+      out_buffer = torch::from_blob(
+          global_buffer.data_ptr<at::Half>() + buffer_size * n_in_channels,
+          {buffer_size, n_out_channels}, options);
+    } else {
+      in_buffer = torch::from_blob(global_buffer.data_ptr<float>(),
+                                   {buffer_size, n_in_channels}, options);
+      out_buffer = torch::from_blob(
+          global_buffer.data_ptr<float>() + buffer_size * n_in_channels,
+          {buffer_size, n_out_channels}, options);
+    }
+  } else {
+    in_buffer = torch::zeros({buffer_size, n_in_channels}, options);
+    out_buffer = torch::zeros({buffer_size, n_out_channels}, options);
+  }
+
+  // all gather
+  cudaDeviceSynchronize();
+  auto start = std::chrono::steady_clock::now();
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      in_feat.type(), "convolution_forward_cuda", ([&] {
+        gather_all_kernel_pad_sep_with_mask<scalar_t>
+            <<<ceil((double)(n_in_feats * n_in_channels) /
+                    (256 << (sizeof(scalar_t) == 2) + 2)),
+               256>>>(n_in_feats, n_in_channels, kernel_volume,
+                      in_feat.data_ptr<scalar_t>(),
+                      in_buffer.data_ptr<scalar_t>(),
+                      neighbor_map.data_ptr<int>(),
+                      neighbor_offset_gpu.data_ptr<int>(),
+                      neighbor_offset_cum_gpu.data_ptr<int>(),
+                      cum_buffer_sizes_gpu.data_ptr<int>(),
+                      input_mask.data_ptr<int>(), output_mask.data_ptr<int>(),
+                      transpose, precompute_mid);
+      }));
+  cudaDeviceSynchronize();
+  auto end = std::chrono::steady_clock::now();
+  duration_gather += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+  start = end;
+  
+  at::Tensor in_buffer_activated, out_buffer_activated, kernel_buffer;
+  int buffer_st;
+  int cur_buffer_size;
+  // for each group
+  // mm_ops = 0, sep; mm_ops = 1, BMM
+  int kernel_cnt = 0;
+  for (int i = 0; i < groups.size(); i++) {
+    switch (mm_ops[i]) {
+      case 0: {
+        for (int j = 0; j < groups[i].size(); j++) {
+          int kmap_idx = groups[i][j];
+          if (kmap_idx == 0)
+            buffer_st = 0;
+          else
+            buffer_st = *(cum_buffer_sizes.data_ptr<int>() + kmap_idx);
+          cur_buffer_size = *(neighbor_offset.data_ptr<int>() + kmap_idx);
+          if (is_half) {
+            in_buffer_activated = torch::from_blob(
+                in_buffer.data_ptr<at::Half>() + buffer_st * n_in_channels,
+                {cur_buffer_size, n_in_channels}, options);
+            out_buffer_activated = torch::from_blob(
+                out_buffer.data_ptr<at::Half>() + buffer_st * n_out_channels,
+                {cur_buffer_size, n_out_channels}, options);
+          } else {
+            in_buffer_activated = torch::from_blob(
+                in_buffer.data_ptr<float>() + buffer_st * n_in_channels,
+                {cur_buffer_size, n_in_channels}, options);
+            out_buffer_activated = torch::from_blob(
+                out_buffer.data_ptr<float>() + buffer_st * n_out_channels,
+                {cur_buffer_size, n_out_channels}, options);
+          }
+          if (conv_mode == 2) {
+            torch::mm_out(out_buffer_activated, in_buffer_activated,
+                          kernel[kernel_cnt]);
+            kernel_cnt++;
+          } else {
+            torch::mm_out(out_buffer_activated, in_buffer_activated,
+                          kernel[kmap_idx]);
+          }
+        }
+        break;
+      }
+      case 1: {
+        int kmap_idx = groups[i][0];
+        if (kmap_idx == 0)
+          buffer_st = 0;
+        else
+          buffer_st = *(cum_buffer_sizes.data_ptr<int>() + kmap_idx);
+        cur_buffer_size = group_sizes[i];
+        if (is_half) {
+          in_buffer_activated = torch::from_blob(
+              in_buffer.data_ptr<at::Half>() + buffer_st * n_in_channels,
+              {(int)(groups[i].size()), cur_buffer_size, n_in_channels},
+              options);
+          out_buffer_activated = torch::from_blob(
+              out_buffer.data_ptr<at::Half>() + buffer_st * n_out_channels,
+              {(int)(groups[i].size()), cur_buffer_size, n_out_channels},
+              options);
+          kernel_buffer = torch::from_blob(
+              kernel[kernel_cnt].data_ptr<at::Half>(),
+              {(int)(groups[i].size()), n_in_channels, n_out_channels},
+              options);
+        } else {
+          in_buffer_activated = torch::from_blob(
+              in_buffer.data_ptr<float>() + buffer_st * n_in_channels,
+              {(int)(groups[i].size()), cur_buffer_size, n_in_channels},
+              options);
+          out_buffer_activated = torch::from_blob(
+              out_buffer.data_ptr<float>() + buffer_st * n_out_channels,
+              {(int)(groups[i].size()), cur_buffer_size, n_out_channels},
+              options);
+          kernel_buffer = torch::from_blob(
+              kernel[kernel_cnt].data_ptr<float>(),
+              {(int)(groups[i].size()), n_in_channels, n_out_channels},
+              options);
+        }
+        torch::bmm_out(out_buffer_activated, in_buffer_activated,
+                       kernel_buffer);
+        kernel_cnt += (int)(groups[i].size());
+        break;
+      }
+    }
+  }
+
+  cudaDeviceSynchronize();
+  end = std::chrono::steady_clock::now();
+  duration_matmul += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+  start = end;
+  if (is_half) {
+    // new version
+    scatter_all_kernel_pad_sep_with_mask_half<<<
+        ceil((double)(n_out_feats * n_out_channels) / 2048), 256>>>(
+        n_out_feats, n_out_channels, kernel_volume,
+        reinterpret_cast<half *>(out_buffer.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(out_feat.data_ptr<at::Half>()),
+        neighbor_map.data_ptr<int>(), neighbor_offset_gpu.data_ptr<int>(),
+        neighbor_offset_cum_gpu.data_ptr<int>(),
+        cum_buffer_sizes_gpu.data_ptr<int>(), input_mask.data_ptr<int>(),
+        output_mask.data_ptr<int>(), transpose, precompute_mid);
+  } else {
+    // new version
+    scatter_all_kernel_pad_sep_with_mask_float<<<
+        ceil((double)(n_out_feats * n_out_channels) / 1024), 256>>>(
+        n_out_feats, n_out_channels, kernel_volume,
+        out_buffer.data_ptr<float>(), out_feat.data_ptr<float>(),
+        neighbor_map.data_ptr<int>(), neighbor_offset_gpu.data_ptr<int>(),
+        neighbor_offset_cum_gpu.data_ptr<int>(),
+        cum_buffer_sizes_gpu.data_ptr<int>(), input_mask.data_ptr<int>(),
+        output_mask.data_ptr<int>(), transpose, precompute_mid);
+  }
+  cudaDeviceSynchronize();
+  end = std::chrono::steady_clock::now();
+  duration_scatter += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+
+  if (precompute_mid)
+    at::addmm_out(out_feat, out_feat, in_feat, kernel[mid_kernel]);
+
+  if (n_out_channels != n_out_channels_original) {
+    out_feat = at::slice(out_feat, 1, 0, n_out_channels_original).contiguous();
+  }
+  return out_feat;
+}
+
+at::Tensor convolution_forward_cuda_fallback_profiling(
+    at::Tensor in_feat, at::Tensor kernel, at::Tensor neighbor_map,
+    const int output_size, const int conv_mode, at::Tensor neighbor_offset,
+    const bool transpose) {
+  if (in_feat.size(1) != kernel.size(1)) {
+    throw std::invalid_argument("Input feature size and kernel size mismatch");
+  }
+  bool is_half = in_feat.scalar_type() == at::ScalarType::Half;
+  auto options =
+      torch::TensorOptions().dtype(in_feat.dtype()).device(in_feat.device());
+  at::Tensor out_feat = torch::zeros({output_size, kernel.size(-1)}, options);
+
+  // need to avoid misaligned memory access
+  bool padded = false;
+  if (is_half) {
+    if (in_feat.size(1) % 2 != 0) {
+      in_feat = torch::cat(
+          {in_feat, torch::zeros({in_feat.size(0), 1}, options)}, -1);
+      kernel = torch::cat(
+          {kernel, torch::zeros({kernel.size(0), 1, kernel.size(2)}, options)},
+          1);
+    }
+    if (out_feat.size(1) % 2 != 0) {
+      out_feat = torch::cat(
+          {out_feat, torch::zeros({out_feat.size(0), 1}, options)}, -1);
+      kernel = torch::cat(
+          {kernel, torch::zeros({kernel.size(0), kernel.size(1), 1}, options)},
+          -1);
+      padded = true;
+    }
+  }
+
+  int n_in_feats = in_feat.size(0);
+  int n_in_channels = in_feat.size(1);
+  int n_out_feats = out_feat.size(0);
+  int n_out_channels = out_feat.size(1);
+  int kernel_volume = kernel.size(0);
+  // memory optimization
+  bool precompute_mid = false;
+  int mid_kernel = kernel_volume / 2;
+  int in_buffer_size = 1;
+  // we can precompute features for w[0,0] which avoids gather/scatter
+  if (kernel_volume % 2 == 1 && n_in_feats == n_out_feats) {
+    precompute_mid = true;
+    in_buffer_size =
+        *std::max_element(neighbor_offset.data_ptr<int>(),
+                          neighbor_offset.data_ptr<int>() + mid_kernel);
+    in_buffer_size = std::max(
+        in_buffer_size,
+        *std::max_element(neighbor_offset.data_ptr<int>() + mid_kernel + 1,
+                          neighbor_offset.data_ptr<int>() + kernel_volume));
+    in_buffer_size = std::max(in_buffer_size, 1);
+    // (N, c) X (c, o) = (N, o)
+    // conv_mode == 2 indicates kernel has been reordered, in which case
+    // w[0,0] is placed at the end
+    int mid_kmap_idx = conv_mode != 2 ? kernel_volume / 2 : kernel_volume - 1;
+    torch::mm_out(out_feat, in_feat, kernel[mid_kmap_idx]);
+  } else {
+    in_buffer_size =
+        *std::max_element(neighbor_offset.data_ptr<int>(),
+                          neighbor_offset.data_ptr<int>() + kernel_volume);
+  }
+  auto in_buffer = torch::zeros({in_buffer_size, n_in_channels}, options);
+  auto out_buffer = torch::zeros({in_buffer_size, n_out_channels}, options);
+  int cur_offset = 0;
+
+  // gather/gemm/scatter on each weight
+  for (int i = 0; i < kernel_volume; i++) {
+    int n_active_feats = neighbor_offset.data_ptr<int>()[i];
+    // if there's no active features for this weight, skip it
+    if (n_active_feats == 0) {
+      continue;
+    }
+    // if w[0,0] was precomputed above, skip it
+    if ((i == mid_kernel) && precompute_mid) {
+      cur_offset += 2 * n_active_feats;
+      continue;
+    }
+    // in_buffer_activated (i, c) holds the dense input features from gather
+    // for i = n_active_feats (# of features in the activated kernel from
+    // neighbor_offset) out_buffer_activated (i, o) holds the dense output
+    // features to scatter
+    at::Tensor out_buffer_activated;
+    at::Tensor in_buffer_activated;
+    if (is_half) {
+      out_buffer_activated =
+          torch::from_blob(out_buffer.data_ptr<at::Half>(),
+                           {n_active_feats, n_out_channels}, options);
+      in_buffer_activated =
+          torch::from_blob(in_buffer.data_ptr<at::Half>(),
+                           {n_active_feats, n_in_channels}, options);
+    } else {
+      out_buffer_activated =
+          torch::from_blob(out_buffer.data_ptr<float>(),
+                           {n_active_feats, n_out_channels}, options);
+      in_buffer_activated =
+          torch::from_blob(in_buffer.data_ptr<float>(),
+                           {n_active_feats, n_in_channels}, options);
+    }
+    // gather n_active_feats dense features from N sparse input features with c
+    // feature dimensions
+    cudaDeviceSynchronize();
+    auto start = std::chrono::steady_clock::now();
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        in_feat.type(), "convolution_forward_cuda", ([&] {
+          gather_kernel<scalar_t>
+              <<<ceil((double)(n_active_feats * n_in_channels) / 256), 256>>>(
+                  n_active_feats, n_in_feats, n_in_channels,
+                  in_feat.data_ptr<scalar_t>(),
+                  in_buffer_activated.data_ptr<scalar_t>(),
+                  neighbor_map.data_ptr<int>() + cur_offset, transpose);
+        }));
+    cudaDeviceSynchronize();
+    auto end = std::chrono::steady_clock::now();
+    duration_gather += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    start = end;
+    // gemm: (i, c) X (c, o) = (i, o)
+    int kmap_idx = i;
+    if (conv_mode == 2) {
+      kmap_idx = i < mid_kernel ? i * 2 : (kernel_volume - i) * 2 - 1;
+    }
+    torch::mm_out(out_buffer_activated, in_buffer_activated, kernel[kmap_idx]);
+
+    cudaDeviceSynchronize();
+    end = std::chrono::steady_clock::now();
+    duration_matmul += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    start = end;
+    // scatter n_active_feats dense features into n_out_feats output features of
+    // dimension n_out_channels
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        in_feat.type(), "convolution_forward_cuda", ([&] {
+          scatter_kernel<scalar_t>
+              <<<ceil((double)(n_active_feats * n_out_channels) / 256), 256>>>(
+                  n_active_feats, n_out_feats, n_out_channels,
+                  out_buffer_activated.data_ptr<scalar_t>(),
+                  out_feat.data_ptr<scalar_t>(),
+                  neighbor_map.data_ptr<int>() + cur_offset, transpose);
+        }));
+    cudaDeviceSynchronize();
+    end = std::chrono::steady_clock::now();
+    duration_scatter += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    cur_offset += 2 * n_active_feats;
+  }
+
+  if (padded) {
+    out_feat = at::slice(out_feat, 1, 0, n_out_channels - 1).contiguous();
+  }
+  return out_feat;
 }

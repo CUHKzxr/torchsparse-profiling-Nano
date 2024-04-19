@@ -6,10 +6,11 @@ from torchsparse import SparseTensor
 from torchsparse.backbones import SparseResNet21D, SparseResUNet42
 from torchsparse.utils.quantize import sparse_quantize
 
+import time
 
 @torch.no_grad()
 def main() -> None:
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda:0' # if torch.cuda.is_available() else 'cpu'
 
     for backbone in [SparseResNet21D, SparseResUNet42]:
         print(f'{backbone.__name__}:')
@@ -17,7 +18,7 @@ def main() -> None:
         model = model.to(device).eval()
 
         # generate data
-        input_size, voxel_size = 10000, 0.2
+        input_size, voxel_size = 1000, 0.2
         inputs = np.random.uniform(-100, 100, size=(input_size, 4))
         pcs, feats = inputs[:, :3], inputs
         pcs -= np.min(pcs, axis=0, keepdims=True)
@@ -27,11 +28,15 @@ def main() -> None:
         coords[:, -1] = 0
         coords = torch.as_tensor(coords, dtype=torch.int)
         feats = torch.as_tensor(feats[indices], dtype=torch.float)
+
+        start_time = time.perf_counter()
         input = SparseTensor(coords=coords, feats=feats).to(device)
 
         # forward
         outputs = model(input)
-
+        end_time = time.perf_counter()
+        print(f"Execution Time: {(end_time - start_time) * 1000} ms")
+        
         # print feature shapes
         for k, output in enumerate(outputs):
             print(f'output[{k}].F.shape = {output.feats.shape}')
